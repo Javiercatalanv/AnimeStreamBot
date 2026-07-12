@@ -4,6 +4,7 @@ import aiohttp
 import asyncio
 import json
 import os
+import random
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -250,10 +251,45 @@ query ($search: String) {
       genres
       coverImage { large }
       siteUrl
+      nextAiringEpisode {
+        airingAt
+        episode
+      }
     }
   }
 }
 """
+
+QUIZ_QUERY = """
+query ($page: Int) {
+  Page(page: $page, perPage: 10) {
+    media(type: ANIME, sort: POPULARITY_DESC, isAdult: false, status: FINISHED) {
+      id
+      title {
+        romaji
+        english
+      }
+      description(asHtml: false)
+      coverImage { large }
+      siteUrl
+      meanScore
+    }
+  }
+}
+"""
+
+async def get_quiz_pool(session):
+    """Obtiene un grupo de animes populares para el quiz."""
+    page = random.randint(1, 15)
+    async with session.post(
+        ANILIST_URL,
+        json={"query": QUIZ_QUERY, "variables": {"page": page}},
+        headers={"Content-Type": "application/json"}
+    ) as resp:
+        if resp.status != 200:
+            return []
+        data = await resp.json()
+        return data.get("data", {}).get("Page", {}).get("media", [])
 
 SEASON_QUERY = """
 query ($season: MediaSeason, $year: Int, $page: Int) {
@@ -374,40 +410,38 @@ async def get_anime_by_id(session, anime_id: int):
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="&", intents=intents, case_insensitive=True, help_command=None)
+bot = commands.Bot(command_prefix="!", intents=intents, case_insensitive=True, help_command=None)
 
 # =============================================
 # Comando: !animeAdd <nombre>
 # =============================================
-@bot.command(name="animeAdd", aliases=["animejoin", "animesub"])
-async def anime_news(ctx, *, anime_name: str):
+def subscribe_channel(guild_id: str, channel_id: str, anime: dict, subscribed_by: str):
     """
-    Suscribe el canal actual a notificaciones de nuevos episodios.
-    Uso: !animeAdd Nombre del Anime
+    Suscribe un canal a un anime. Reutilizable desde comandos y botones.
+    Devuelve (embed, ok).
     """
-    channel_id = str(ctx.channel.id)
-    guild_id = str(ctx.guild.id)
-
-    await ctx.send(f"🔍 Buscando **{anime_name}**...")
-
-    async with aiohttp.ClientSession() as session:
-        anime = await search_anime(session, anime_name)
-
-    if not anime:
-        await ctx.send(f"❌ No encontré el anime **{anime_name}** en emisión. Prueba con otro nombre.")
-        return
-
     title = anime["title"]["english"] or anime["title"]["romaji"]
     anime_id = anime["id"]
-    next_ep = anime["nextAiringEpisode"]
+    next_ep = anime.get("nextAiringEpisode")
 
-    # Guardar suscripción
+    if anime.get("status") == "FINISHED":
+        embed = discord.Embed(
+            title=f"⚠️ {title} ya finalizó",
+            description="Este anime no tiene próximos episodios, no tiene sentido suscribirse.",
+            color=0xF39C12
+        )
+        return embed, False
+
     data = load_data()
     key = f"{guild_id}_{channel_id}_{anime_id}"
 
     if key in data:
-        await ctx.send(f"⚠️ Ya estás suscrito a **{title}** en este canal.")
-        return
+        embed = discord.Embed(
+            title=f"⚠️ Ya suscrito",
+            description=f"Este canal ya está suscrito a **{title}**.",
+            color=0xF39C12
+        )
+        return embed, False
 
     data[key] = {
         "guild_id": guild_id,
@@ -417,14 +451,13 @@ async def anime_news(ctx, *, anime_name: str):
         "cover": anime["coverImage"]["large"],
         "url": anime["siteUrl"],
         "last_notified_episode": (next_ep["episode"] - 1) if next_ep else 0,
-        "subscribed_by": ctx.author.display_name
+        "subscribed_by": subscribed_by
     }
     save_data(data)
 
-    # Construir respuesta
     embed = discord.Embed(
         title=f"✅ Suscrito a {title}",
-        description=f"Te avisaré en este canal cada vez que salga un nuevo episodio.",
+        description="Te avisaré en este canal cada vez que salga un nuevo episodio.",
         color=0x7289DA
     )
     score = anime.get("meanScore")
@@ -440,7 +473,6 @@ async def anime_news(ctx, *, anime_name: str):
     embed.set_thumbnail(url=anime["coverImage"]["large"])
 
     if next_ep:
-        airing_time = datetime.fromtimestamp(next_ep["airingAt"], tz=timezone.utc)
         embed.add_field(
             name="📅 Próximo episodio",
             value=f"Episodio **{next_ep['episode']}** — <t:{next_ep['airingAt']}:F> (<t:{next_ep['airingAt']}:R>)",
@@ -449,8 +481,148 @@ async def anime_news(ctx, *, anime_name: str):
     else:
         embed.add_field(name="📅 Próximo episodio", value="Sin fecha confirmada aún.", inline=False)
 
-    embed.set_footer(text=f"Fuente: AniList | Suscrito por {ctx.author.display_name}")
-    await ctx.send(embed=embed)
+    embed.set_footer(text=f"Fuente: AniList | Suscrito por {subscribed_by}")
+    return embed, True
+
+# =============================================
+# Views: botones interactivos
+# =============================================
+class SubscribeButton(discord.ui.Button):
+    """Botón ➕ para suscribirse a un anime desde resultados de búsqueda."""
+    def __init__(self, anime: dict, index: int):
+        title = anime["title"]["english"] or anime["title"]["romaji"]
+        super().__init__(
+            style=discord.ButtonStyle.primary,
+            label=f"{index}. {title}"[:80],
+            emoji="➕",
+            row=(index - 1) % 5
+        )
+        self.anime = anime
+
+    async def callback(self, interaction: discord.Interaction):
+        embed, ok = subscribe_channel(
+            guild_id=str(interaction.guild.id),
+            channel_id=str(interaction.channel.id),
+            anime=self.anime,
+            subscribed_by=interaction.user.display_name
+        )
+        if ok:
+            self.disabled = True
+            self.style = discord.ButtonStyle.success
+            self.emoji = "✅"
+        await interaction.response.edit_message(view=self.view)
+        await interaction.followup.send(embed=embed)
+
+class SubscribeView(discord.ui.View):
+    """View con un botón de suscripción por cada resultado de búsqueda."""
+    def __init__(self, animes: list, timeout=180):
+        super().__init__(timeout=timeout)
+        for i, anime in enumerate(animes[:5], 1):
+            self.add_item(SubscribeButton(anime, i))
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+class ConfirmRemoveView(discord.ui.View):
+    """Confirmación ✅/❌ antes de eliminar suscripciones."""
+    def __init__(self, author_id: int, keys_to_delete: list, anime_names: list, timeout=60):
+        super().__init__(timeout=timeout)
+        self.author_id = author_id
+        self.keys_to_delete = keys_to_delete
+        self.anime_names = anime_names
+        self.resolved = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "⛔ Solo quien usó el comando puede confirmar.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Confirmar", style=discord.ButtonStyle.danger, emoji="✅")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_data()
+        deleted = []
+        for k in self.keys_to_delete:
+            if k in data:
+                deleted.append(data[k]["anime_name"])
+                del data[k]
+        save_data(data)
+        self.resolved = True
+        for item in self.children:
+            item.disabled = True
+        nombres = ", ".join(f"**{n}**" for n in deleted)
+        await interaction.response.edit_message(
+            content=f"🗑️ Suscripción a {nombres} eliminada correctamente.",
+            embed=None, view=self
+        )
+        self.stop()
+
+    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary, emoji="❌")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.resolved = True
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content="👍 Operación cancelada, no se eliminó nada.",
+            embed=None, view=self
+        )
+        self.stop()
+
+# =============================================
+# Comando: !animeAdd <nombre>
+# =============================================
+@bot.command(name="animeAdd", aliases=["animejoin", "animesub"])
+async def anime_news(ctx, *, anime_name: str):
+    """
+    Suscribe el canal actual a notificaciones de nuevos episodios.
+    Uso: !animeAdd Nombre del Anime
+    """
+    await ctx.send(f"🔍 Buscando **{anime_name}**...")
+
+    async with aiohttp.ClientSession() as session:
+        anime = await search_anime(session, anime_name)
+
+        if anime:
+            embed, ok = subscribe_channel(
+                guild_id=str(ctx.guild.id),
+                channel_id=str(ctx.channel.id),
+                anime=anime,
+                subscribed_by=ctx.author.display_name
+            )
+            await ctx.send(embed=embed)
+            return
+
+        # Búsqueda difusa: no hubo match exacto en emisión,
+        # buscamos parecidos y ofrecemos botones
+        sugerencias = await search_anime_multi(session, anime_name)
+
+    if not sugerencias:
+        await ctx.send(
+            f"❌ No encontré nada parecido a **{anime_name}**. "
+            f"Revisa la ortografía o prueba con el nombre en inglés/romaji."
+        )
+        return
+
+    embed = discord.Embed(
+        title=f"🤔 No encontré \"{anime_name}\" en emisión",
+        description="¿Quisiste decir alguno de estos? Toca el botón para suscribirte:",
+        color=0xF39C12
+    )
+    status_map = {
+        "FINISHED": "✅ Finalizado", "RELEASING": "📡 En emisión",
+        "NOT_YET_RELEASED": "⏳ Próximamente", "CANCELLED": "❌ Cancelado", "HIATUS": "⏸️ En pausa"
+    }
+    for i, a in enumerate(sugerencias, 1):
+        t = a["title"]["english"] or a["title"]["romaji"]
+        st = status_map.get(a.get("status", ""), "")
+        score = a.get("meanScore")
+        score_str = f" • ⭐ {score/10:.1f}" if score else ""
+        embed.add_field(name=f"{i}. {t}", value=f"{st}{score_str}", inline=False)
+
+    await ctx.send(embed=embed, view=SubscribeView(sugerencias))
 
 # =============================================
 # Comando: !animeList — ver suscripciones activas
@@ -478,7 +650,7 @@ async def anime_list(ctx):
 # =============================================
 @bot.command(name="animeRemove", aliases=[])
 async def anime_remove(ctx, *, anime_name: str):
-    """Elimina una suscripción de este canal."""
+    """Elimina una suscripción de este canal (con confirmación)."""
     channel_id = str(ctx.channel.id)
     guild_id = str(ctx.guild.id)
     data = load_data()
@@ -494,12 +666,21 @@ async def anime_remove(ctx, *, anime_name: str):
         await ctx.send(f"❌ No encontré una suscripción para **{anime_name}** en este canal.")
         return
 
-    for k in to_delete:
-        name = data[k]["anime_name"]
-        del data[k]
+    anime_names = [data[k]["anime_name"] for k in to_delete]
 
-    save_data(data)
-    await ctx.send(f"🗑️ Suscripción a **{name}** eliminada correctamente.")
+    if len(to_delete) == 1:
+        desc = f"¿Seguro que quieres eliminar la suscripción a **{anime_names[0]}**?"
+    else:
+        lista = "\n".join(f"• **{n}**" for n in anime_names)
+        desc = (
+            f"Tu búsqueda coincide con **{len(to_delete)} suscripciones**:\n{lista}\n\n"
+            f"¿Seguro que quieres eliminarlas TODAS?"
+        )
+
+    embed = discord.Embed(title="🗑️ Confirmar eliminación", description=desc, color=0xE74C3C)
+    embed.set_footer(text="Tienes 60 segundos para confirmar")
+    view = ConfirmRemoveView(ctx.author.id, to_delete, anime_names)
+    await ctx.send(embed=embed, view=view)
 
 
 # =============================================
@@ -872,8 +1053,8 @@ async def anime_search_cmd(ctx, *, anime_name: str):
         )
 
     embed.set_thumbnail(url=results[0]["coverImage"]["large"])
-    embed.set_footer(text="Usa !animeAdd <nombre> para suscribirte a uno • Fuente: AniList")
-    await ctx.send(embed=embed)
+    embed.set_footer(text="Toca ➕ para suscribirte directamente • Fuente: AniList")
+    await ctx.send(embed=embed, view=SubscribeView(results))
 
 # =============================================
 # Comando: !animeSeason — animes de la temporada
@@ -998,6 +1179,182 @@ async def anime_genre(ctx, *, genre: str):
     await ctx.send(embed=embed)
 
 # =============================================
+# Comando: !animeNext — próximos episodios de tus suscripciones
+# =============================================
+@bot.command(name="animeNext", aliases=["next", "proximos", "próximos"])
+async def anime_next(ctx):
+    """Muestra las suscripciones del canal ordenadas por cuál episodio sale antes."""
+    channel_id = str(ctx.channel.id)
+    guild_id = str(ctx.guild.id)
+    data = load_data()
+
+    subs = [v for v in data.values() if v["guild_id"] == guild_id and v["channel_id"] == channel_id]
+
+    if not subs:
+        await ctx.send("📋 No hay animes suscritos en este canal. Usa `!animeAdd Nombre` para agregar uno.")
+        return
+
+    await ctx.send("⏳ Consultando próximos episodios...")
+
+    resultados = []
+    async with aiohttp.ClientSession() as session:
+        for sub in subs:
+            try:
+                anime = await get_anime_by_id(session, sub["anime_id"])
+                if anime:
+                    next_ep = anime.get("nextAiringEpisode")
+                    resultados.append((sub, next_ep))
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                print(f"[ERROR] animeNext {sub['anime_name']}: {e}")
+
+    # Ordenar: primero los que tienen fecha (por cercanía), luego los sin fecha
+    con_fecha = sorted(
+        [r for r in resultados if r[1]],
+        key=lambda r: r[1]["airingAt"]
+    )
+    sin_fecha = [r for r in resultados if not r[1]]
+
+    embed = discord.Embed(
+        title="⏭️ Próximos episodios",
+        description="Tus suscripciones ordenadas por cuál sale antes:",
+        color=0x1ABC9C
+    )
+
+    MEDALS = ["🔜", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    for i, (sub, next_ep) in enumerate(con_fecha):
+        emoji = MEDALS[i] if i < len(MEDALS) else "▫️"
+        embed.add_field(
+            name=f"{emoji} {sub['anime_name']}",
+            value=f"Ep. **{next_ep['episode']}** — <t:{next_ep['airingAt']}:F> (<t:{next_ep['airingAt']}:R>)",
+            inline=False
+        )
+
+    for sub, _ in sin_fecha:
+        embed.add_field(
+            name=f"❔ {sub['anime_name']}",
+            value="Sin fecha confirmada para el próximo episodio.",
+            inline=False
+        )
+
+    if con_fecha:
+        embed.set_thumbnail(url=con_fecha[0][0]["cover"])
+    embed.set_footer(text="Fuente: AniList • Horarios en tu zona horaria local")
+    await ctx.send(embed=embed)
+
+# =============================================
+# Comando: !animeQuiz — adivina el anime por la sinopsis
+# =============================================
+import re as _re
+
+def _clean_quiz_description(desc: str, titles: list) -> str:
+    """Limpia HTML y censura los títulos dentro de la sinopsis."""
+    desc = desc.replace("<br>", " ").replace("<i>", "").replace("</i>", "")
+    desc = desc.replace("<b>", "").replace("</b>", "")
+    desc = _re.sub(r"\(Source:.*?\)", "", desc, flags=_re.IGNORECASE)
+    for t in titles:
+        if t:
+            desc = _re.sub(_re.escape(t), "▓▓▓▓▓", desc, flags=_re.IGNORECASE)
+            # También censurar palabras individuales largas del título
+            for palabra in t.split():
+                if len(palabra) > 3:
+                    desc = _re.sub(_re.escape(palabra), "▓▓▓", desc, flags=_re.IGNORECASE)
+    return desc.strip()[:600]
+
+class QuizView(discord.ui.View):
+    """4 botones de opciones para el quiz."""
+    def __init__(self, opciones: list, correcta: dict, timeout=45):
+        super().__init__(timeout=timeout)
+        self.correcta = correcta
+        self.respondido = False
+        random.shuffle(opciones)
+        for anime in opciones:
+            self.add_item(QuizButton(anime, es_correcta=(anime is correcta)))
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+class QuizButton(discord.ui.Button):
+    def __init__(self, anime: dict, es_correcta: bool):
+        title = anime["title"]["english"] or anime["title"]["romaji"]
+        super().__init__(style=discord.ButtonStyle.primary, label=title[:80])
+        self.es_correcta = es_correcta
+        self.anime = anime
+
+    async def callback(self, interaction: discord.Interaction):
+        view: QuizView = self.view
+        if view.respondido:
+            await interaction.response.defer()
+            return
+        view.respondido = True
+
+        correcta_title = view.correcta["title"]["english"] or view.correcta["title"]["romaji"]
+
+        for item in view.children:
+            item.disabled = True
+            if isinstance(item, QuizButton):
+                if item.es_correcta:
+                    item.style = discord.ButtonStyle.success
+                elif item is self:
+                    item.style = discord.ButtonStyle.danger
+
+        if self.es_correcta:
+            resultado = discord.Embed(
+                title=f"🎉 ¡Correcto, {interaction.user.display_name}!",
+                description=f"Era **{correcta_title}**.",
+                color=0x2ECC71,
+                url=view.correcta["siteUrl"]
+            )
+        else:
+            resultado = discord.Embed(
+                title=f"❌ Incorrecto, {interaction.user.display_name}",
+                description=f"La respuesta era **{correcta_title}**.",
+                color=0xE74C3C,
+                url=view.correcta["siteUrl"]
+            )
+        resultado.set_thumbnail(url=view.correcta["coverImage"]["large"])
+        score = view.correcta.get("meanScore")
+        if score:
+            resultado.set_footer(text=f"⭐ {score/10:.1f}/10 en AniList")
+
+        await interaction.response.edit_message(view=view)
+        await interaction.followup.send(embed=resultado)
+        view.stop()
+
+@bot.command(name="animeQuiz", aliases=["quiz"])
+async def anime_quiz(ctx):
+    """Adivina el anime a partir de su sinopsis. 4 opciones, 45 segundos."""
+    await ctx.send("🎲 Preparando el quiz...")
+
+    async with aiohttp.ClientSession() as session:
+        pool = await get_quiz_pool(session)
+
+    # Necesitamos al menos 4 animes con descripción decente
+    candidatos = [a for a in pool if a.get("description") and len(a["description"]) > 150]
+    if len(candidatos) < 4:
+        await ctx.send("❌ No pude preparar el quiz en este momento. Inténtalo de nuevo.")
+        return
+
+    opciones = random.sample(candidatos, 4)
+    correcta = random.choice(opciones)
+
+    titles_a_censurar = [
+        correcta["title"].get("english"),
+        correcta["title"].get("romaji")
+    ]
+    sinopsis = _clean_quiz_description(correcta["description"], titles_a_censurar)
+
+    embed = discord.Embed(
+        title="🧩 ¿Qué anime es este?",
+        description=f"*{sinopsis}*",
+        color=0x9B59B6
+    )
+    embed.set_footer(text="⏱️ Tienes 45 segundos • El primero en responder gana")
+
+    await ctx.send(embed=embed, view=QuizView(opciones, correcta))
+
+# =============================================
 # Comando: !animeHelp — muestra todos los comandos
 # =============================================
 @bot.command(name="animeHelp", aliases=["help", "ayuda", "comandos"])
@@ -1012,39 +1369,44 @@ async def anime_help(ctx):
     # ── Suscripciones ──
     embed.add_field(name="\u200b", value="**📡 Suscripciones**", inline=False)
     embed.add_field(
-        name="➕ `&animeAdd <nombre>`",
+        name="➕ `!animeAdd <nombre>`",
         value=(
             "Suscribe **este canal** a notificaciones automáticas cuando salga un episodio nuevo.\n"
-            "**Ejemplo:** `&animeAdd One Piece`"
+            "**Ejemplo:** `!animeAdd One Piece`"
         ),
         inline=False
     )
     embed.add_field(
-        name="📋 `&animeList`",
-        value="Muestra todos los animes suscritos en este canal.\n**Ejemplo:** `&animeList`",
+        name="📋 `!animeList`",
+        value="Muestra todos los animes suscritos en este canal.\n**Ejemplo:** `!animeList`",
         inline=False
     )
     embed.add_field(
-        name="🗑️ `&animeRemove <nombre>`",
-        value="Cancela la suscripción a un anime en este canal.\n**Ejemplo:** `&animeRemove One Piece`",
+        name="🗑️ `!animeRemove <nombre>`",
+        value="Cancela la suscripción a un anime en este canal (con confirmación).\n**Ejemplo:** `!animeRemove One Piece`",
+        inline=False
+    )
+    embed.add_field(
+        name="⏭️ `!animeNext`",
+        value="Muestra tus suscripciones ordenadas por cuál episodio sale antes.\n**Ejemplo:** `!animeNext`",
         inline=False
     )
 
     # ── Información ──
     embed.add_field(name="\u200b", value="**🔍 Información**", inline=False)
     embed.add_field(
-        name="ℹ️ `&animeInfo <nombre>`",
+        name="ℹ️ `!animeInfo <nombre>`",
         value=(
             "Ficha completa de un anime: sinopsis, géneros, estudio, puntuación, episodios, estado y más.\n"
-            "**Ejemplo:** `&animeInfo Fullmetal Alchemist`"
+            "**Ejemplo:** `!animeInfo Fullmetal Alchemist`"
         ),
         inline=False
     )
     embed.add_field(
-        name="🔎 `&animeSearch <nombre>`",
+        name="🔎 `!animeSearch <nombre>`",
         value=(
             "Busca un anime y muestra los 5 primeros resultados. Útil cuando no sabes el nombre exacto.\n"
-            "**Ejemplo:** `&animeSearch ataque`"
+            "**Ejemplo:** `!animeSearch ataque`"
         ),
         inline=False
     )
@@ -1052,16 +1414,16 @@ async def anime_help(ctx):
     # ── Rankings y recomendaciones ──
     embed.add_field(name="\u200b", value="**🏆 Rankings y recomendaciones**", inline=False)
     embed.add_field(
-        name="🏆 `&animeTop`",
-        value="TOP 5 animes mejor calificados de todos los tiempos.\n**Ejemplo:** `&animeTop`",
+        name="🏆 `!animeTop`",
+        value="TOP 5 animes mejor calificados de todos los tiempos.\n**Ejemplo:** `!animeTop`",
         inline=False
     )
     embed.add_field(
-        name="🎭 `&animeGenre <género>`",
+        name="🎭 `!animeGenre <género>`",
         value=(
             "TOP 5 mejor calificados de un género específico.\n"
             "**Géneros:** Action, Romance, Horror, Comedy, Drama, Fantasy, Thriller...\n"
-            "**Ejemplo:** `&animeGenre Romance`"
+            "**Ejemplo:** `!animeGenre Romance`"
         ),
         inline=False
     )
@@ -1069,18 +1431,26 @@ async def anime_help(ctx):
     # ── Calendario ──
     embed.add_field(name="\u200b", value="**📅 Calendario**", inline=False)
     embed.add_field(
-        name="🗓️ `&animeSeason`",
-        value="Muestra los animes más populares de la temporada actual.\n**Ejemplo:** `&animeSeason`",
+        name="🗓️ `!animeSeason`",
+        value="Muestra los animes más populares de la temporada actual.\n**Ejemplo:** `!animeSeason`",
         inline=False
     )
     embed.add_field(
-        name="📅 `&animeSchedule`",
-        value="Calendario semanal completo con qué animes emiten episodio cada día.\n**Ejemplo:** `&animeSchedule`",
+        name="📅 `!animeSchedule`",
+        value="Calendario semanal completo con qué animes emiten episodio cada día.\n**Ejemplo:** `!animeSchedule`",
+        inline=False
+    )
+
+    # ── Juegos ──
+    embed.add_field(name="\u200b", value="**🎮 Juegos**", inline=False)
+    embed.add_field(
+        name="🧩 `!animeQuiz`",
+        value="Adivina el anime a partir de su sinopsis. 4 opciones, 45 segundos, gana el primero en responder.\n**Ejemplo:** `!animeQuiz`",
         inline=False
     )
 
     embed.add_field(
-        name="❓ `&animeHelp`",
+        name="❓ `!animeHelp`",
         value="Muestra este mensaje de ayuda.",
         inline=False
     )
