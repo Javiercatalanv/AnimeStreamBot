@@ -8,11 +8,17 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 # =============================================
-# CONFIGURACIÓN - Edita estos valores
+# CONFIGURACIÓN
 # =============================================
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHECK_INTERVAL_MINUTES = 30  # Cada cuántos minutos revisar nuevos episodios
+
+if not BOT_TOKEN:
+    raise ValueError(
+        "⚠️ No se encontró BOT_TOKEN. Crea un archivo .env con la línea:\n"
+        "BOT_TOKEN=tu_token_aquí"
+    )
 
 # =============================================
 # Archivo para guardar suscripciones y estado
@@ -75,6 +81,7 @@ query ($id: Int) {
     siteUrl
     meanScore
     popularity
+    episodes
     nextAiringEpisode {
       airingAt
       episode
@@ -367,7 +374,7 @@ async def get_anime_by_id(session, anime_id: int):
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents, case_insensitive=True)
+bot = commands.Bot(command_prefix="&", intents=intents, case_insensitive=True, help_command=None)
 
 # =============================================
 # Comando: !animeAdd <nombre>
@@ -565,7 +572,7 @@ async def anime_schedule(ctx):
         if chunk:
             embed.add_field(name=f"{len(animes_del_dia)} animes", value=chunk, inline=False)
 
-        embed.set_footer(text="Horarios en UTC • Fuente: AniList")
+        embed.set_footer(text="Horarios en tu zona horaria local • Fuente: AniList")
         await ctx.send(embed=embed)
         embeds_enviados += 1
         await asyncio.sleep(0.5)  # Evitar rate limit de Discord
@@ -626,11 +633,59 @@ async def anime_top(ctx):
 # =============================================
 # Tarea en background: revisa nuevos episodios
 # =============================================
+async def get_notification_channel(sub):
+    """Obtiene el canal de la suscripción, usando fetch si no está en caché."""
+    channel = bot.get_channel(int(sub["channel_id"]))
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(int(sub["channel_id"]))
+        except (discord.NotFound, discord.Forbidden):
+            return None
+    return channel
+
+def build_episode_embed(sub, anime, aired_episode, next_ep=None, is_final=False):
+    """Construye el embed de notificación de nuevo episodio."""
+    if is_final:
+        title = "🏁 ¡Episodio FINAL disponible!"
+        desc = f"**{sub['anime_name']}** — Episodio **{aired_episode}** (FINAL) ya está disponible en Crunchyroll."
+    else:
+        title = "🎬 ¡Nuevo episodio disponible!"
+        desc = f"**{sub['anime_name']}** — Episodio **{aired_episode}** ya está disponible en Crunchyroll."
+
+    embed = discord.Embed(title=title, description=desc, color=0xFF6B35, url=sub["url"])
+    embed.set_thumbnail(url=sub["cover"])
+
+    score = anime.get("meanScore")
+    if score:
+        embed.add_field(
+            name="⭐ Puntuación global",
+            value=f"**{score/10:.1f}/10** — {anime.get('popularity', 0):,} usuarios",
+            inline=False
+        )
+
+    if next_ep:
+        embed.add_field(
+            name="📅 Próximo episodio",
+            value=f"Ep. **{next_ep['episode']}** — <t:{next_ep['airingAt']}:F> (<t:{next_ep['airingAt']}:R>)",
+            inline=False
+        )
+    elif is_final:
+        embed.add_field(
+            name="✅ Serie finalizada",
+            value="Este era el último episodio. La suscripción se eliminará automáticamente.",
+            inline=False
+        )
+
+    embed.set_footer(text="Fuente: AniList • El episodio suele llegar a Crunchyroll ~1h después de Japón")
+    return embed
+
 @tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
 async def check_new_episodes():
     data = load_data()
     if not data:
         return
+
+    changed = False
 
     async with aiohttp.ClientSession() as session:
         for key, sub in list(data.items()):
@@ -641,59 +696,53 @@ async def check_new_episodes():
 
                 next_ep = anime.get("nextAiringEpisode")
                 status = anime.get("status")
+                total_episodes = anime.get("episodes")
+                last_notified = sub.get("last_notified_episode", 0)
 
-                # Si terminó y ya notificamos el último episodio, saltar
-                if status == "FINISHED":
-                    continue
+                if next_ep:
+                    # Si AniList dice que el próximo es el N, el N-1 ya salió.
+                    # No comparamos horas: el avance del campo ES la señal.
+                    aired_episode = next_ep["episode"] - 1
 
-                if not next_ep:
-                    continue
+                    if aired_episode > last_notified:
+                        channel = await get_notification_channel(sub)
+                        if channel:
+                            # Si nos saltamos varios episodios (bot caído), avisar cada uno
+                            for ep in range(last_notified + 1, aired_episode + 1):
+                                is_last_of_batch = (ep == aired_episode)
+                                embed = build_episode_embed(
+                                    sub, anime, ep,
+                                    next_ep=next_ep if is_last_of_batch else None
+                                )
+                                await channel.send(embed=embed)
+                                await asyncio.sleep(1)
 
-                # El episodio que está a punto de salir
-                upcoming_episode = next_ep["episode"]
-                airing_at = next_ep["airingAt"]
-                now_ts = int(datetime.now(tz=timezone.utc).timestamp())
+                        data[key]["last_notified_episode"] = aired_episode
+                        changed = True
 
-                # Si ya pasó la hora de emisión y no lo habíamos notificado
-                aired_episode = upcoming_episode - 1  # El que ya salió al aire
-                if now_ts >= airing_at and aired_episode > sub["last_notified_episode"]:
-                    channel = bot.get_channel(int(sub["channel_id"]))
-                    if channel:
-                        embed = discord.Embed(
-                            title=f"🎬 ¡Nuevo episodio disponible!",
-                            description=f"**{sub['anime_name']}** — Episodio **{aired_episode}** ya está disponible en Crunchyroll.",
-                            color=0xFF6B35,
-                            url=sub["url"]
-                        )
-                        embed.set_thumbnail(url=sub["cover"])
-                        score = anime.get("meanScore")
-                        if score:
-                            embed.add_field(
-                                name="⭐ Puntuación global",
-                                value=f"**{score/10:.1f}/10** — {anime.get('popularity', 0):,} usuarios",
-                                inline=True
-                            )
-                        embed.add_field(
-                            name="⏰ Emitido en Japón",
-                            value=f"<t:{airing_at}:F>",
-                            inline=False
-                        )
-                        if next_ep:
-                            embed.add_field(
-                                name="📅 Próximo episodio",
-                                value=f"Ep. **{upcoming_episode}** — <t:{airing_at}:R>",
-                                inline=False
-                            )
-                        embed.set_footer(text="Fuente: AniList • El episodio suele llegar a Crunchyroll ~1h después")
-                        await channel.send(embed=embed)
+                elif status == "FINISHED" and total_episodes:
+                    # El anime terminó: notificar el episodio final si falta
+                    if total_episodes > last_notified:
+                        channel = await get_notification_channel(sub)
+                        if channel:
+                            for ep in range(last_notified + 1, total_episodes + 1):
+                                is_final = (ep == total_episodes)
+                                embed = build_episode_embed(
+                                    sub, anime, ep, next_ep=None, is_final=is_final
+                                )
+                                await channel.send(embed=embed)
+                                await asyncio.sleep(1)
 
-                    # Actualizar último episodio notificado
-                    data[key]["last_notified_episode"] = aired_episode
-                    save_data(data)
+                    # Eliminar la suscripción, ya no hay más episodios
+                    del data[key]
+                    changed = True
 
-                await asyncio.sleep(1)  # Pequeña pausa entre peticiones
+                await asyncio.sleep(1)  # Pausa entre peticiones a AniList
             except Exception as e:
-                print(f"[ERROR] Al revisar {sub['anime_name']}: {e}")
+                print(f"[ERROR] Al revisar {sub.get('anime_name', key)}: {e}")
+
+    if changed:
+        save_data(data)
 
 @check_new_episodes.before_loop
 async def before_check():
@@ -951,7 +1000,7 @@ async def anime_genre(ctx, *, genre: str):
 # =============================================
 # Comando: !animeHelp — muestra todos los comandos
 # =============================================
-@bot.command(name="animeHelp", aliases=[])
+@bot.command(name="animeHelp", aliases=["help", "ayuda", "comandos"])
 async def anime_help(ctx):
     """Muestra todos los comandos disponibles del bot."""
     embed = discord.Embed(
@@ -963,39 +1012,39 @@ async def anime_help(ctx):
     # ── Suscripciones ──
     embed.add_field(name="\u200b", value="**📡 Suscripciones**", inline=False)
     embed.add_field(
-        name="➕ `!animeAdd <nombre>`",
+        name="➕ `&animeAdd <nombre>`",
         value=(
             "Suscribe **este canal** a notificaciones automáticas cuando salga un episodio nuevo.\n"
-            "**Ejemplo:** `!animeAdd Haikyuu!!`"
+            "**Ejemplo:** `&animeAdd One Piece`"
         ),
         inline=False
     )
     embed.add_field(
-        name="📋 `!animeList`",
-        value="Muestra todos los animes suscritos en este canal.\n**Ejemplo:** `!animeList`",
+        name="📋 `&animeList`",
+        value="Muestra todos los animes suscritos en este canal.\n**Ejemplo:** `&animeList`",
         inline=False
     )
     embed.add_field(
-        name="🗑️ `!animeRemove <nombre>`",
-        value="Cancela la suscripción a un anime en este canal.\n**Ejemplo:** `!animeRemove One Piece`",
+        name="🗑️ `&animeRemove <nombre>`",
+        value="Cancela la suscripción a un anime en este canal.\n**Ejemplo:** `&animeRemove One Piece`",
         inline=False
     )
 
     # ── Información ──
     embed.add_field(name="\u200b", value="**🔍 Información**", inline=False)
     embed.add_field(
-        name="ℹ️ `!animeInfo <nombre>`",
+        name="ℹ️ `&animeInfo <nombre>`",
         value=(
             "Ficha completa de un anime: sinopsis, géneros, estudio, puntuación, episodios, estado y más.\n"
-            "**Ejemplo:** `!animeInfo Fullmetal Alchemist`"
+            "**Ejemplo:** `&animeInfo Fullmetal Alchemist`"
         ),
         inline=False
     )
     embed.add_field(
-        name="🔎 `!animeSearch <nombre>`",
+        name="🔎 `&animeSearch <nombre>`",
         value=(
             "Busca un anime y muestra los 5 primeros resultados. Útil cuando no sabes el nombre exacto.\n"
-            "**Ejemplo:** `!animeSearch ataque`"
+            "**Ejemplo:** `&animeSearch ataque`"
         ),
         inline=False
     )
@@ -1003,16 +1052,16 @@ async def anime_help(ctx):
     # ── Rankings y recomendaciones ──
     embed.add_field(name="\u200b", value="**🏆 Rankings y recomendaciones**", inline=False)
     embed.add_field(
-        name="🏆 `!animeTop`",
-        value="TOP 5 animes mejor calificados de todos los tiempos.\n**Ejemplo:** `!animeTop`",
+        name="🏆 `&animeTop`",
+        value="TOP 5 animes mejor calificados de todos los tiempos.\n**Ejemplo:** `&animeTop`",
         inline=False
     )
     embed.add_field(
-        name="🎭 `!animeGenre <género>`",
+        name="🎭 `&animeGenre <género>`",
         value=(
             "TOP 5 mejor calificados de un género específico.\n"
             "**Géneros:** Action, Romance, Horror, Comedy, Drama, Fantasy, Thriller...\n"
-            "**Ejemplo:** `!animeGenre Romance`"
+            "**Ejemplo:** `&animeGenre Romance`"
         ),
         inline=False
     )
@@ -1020,18 +1069,18 @@ async def anime_help(ctx):
     # ── Calendario ──
     embed.add_field(name="\u200b", value="**📅 Calendario**", inline=False)
     embed.add_field(
-        name="🗓️ `!animeSeason`",
-        value="Muestra los animes más populares de la temporada actual.\n**Ejemplo:** `!animeSeason`",
+        name="🗓️ `&animeSeason`",
+        value="Muestra los animes más populares de la temporada actual.\n**Ejemplo:** `&animeSeason`",
         inline=False
     )
     embed.add_field(
-        name="📅 `!animeSchedule`",
-        value="Calendario semanal completo con qué animes emiten episodio cada día.\n**Ejemplo:** `!animeSchedule`",
+        name="📅 `&animeSchedule`",
+        value="Calendario semanal completo con qué animes emiten episodio cada día.\n**Ejemplo:** `&animeSchedule`",
         inline=False
     )
 
     embed.add_field(
-        name="❓ `!animeHelp`",
+        name="❓ `&animeHelp`",
         value="Muestra este mensaje de ayuda.",
         inline=False
     )
@@ -1040,7 +1089,7 @@ async def anime_help(ctx):
         name="ℹ️ ¿Cómo funciona?",
         value=(
             f"El bot revisa cada **{CHECK_INTERVAL_MINUTES} minutos** si hay nuevos episodios usando la API de AniList. "
-            "Cuando detecta que un episodio ya se emitió en Japón, envía una notificación en el canal suscrito. "
+            "Cuando un episodio nuevo sale al aire, envía una notificación en el canal suscrito. "
             "Crunchyroll suele tenerlo disponible **~1 hora después**."
         ),
         inline=False
@@ -1064,8 +1113,7 @@ async def on_command_error(ctx, error):
 
     if isinstance(error, commands.MissingRequiredArgument):
         mensajes = {
-            "animadd":    f"⚠️ Debes indicar el nombre del anime.\n**Uso:** `{prefix}animeAdd <nombre>`\n**Ejemplo:** `{prefix}animeAdd Haikyuu!!`",
-            "animeadd":   f"⚠️ Debes indicar el nombre del anime.\n**Uso:** `{prefix}animeAdd <nombre>`\n**Ejemplo:** `{prefix}animeAdd Haikyuu!!`",
+            "animeadd":   f"⚠️ Debes indicar el nombre del anime.\n**Uso:** `{prefix}animeAdd <nombre>`\n**Ejemplo:** `{prefix}animeAdd One Piece`",
             "animeremove":f"⚠️ Debes indicar el nombre del anime a eliminar.\n**Uso:** `{prefix}animeRemove <nombre>`\n**Ejemplo:** `{prefix}animeRemove One Piece`",
             "animeinfo":  f"⚠️ Debes indicar el nombre del anime.\n**Uso:** `{prefix}animeInfo <nombre>`\n**Ejemplo:** `{prefix}animeInfo Fullmetal Alchemist`",
             "animesearch":f"⚠️ Debes indicar qué quieres buscar.\n**Uso:** `{prefix}animeSearch <nombre>`\n**Ejemplo:** `{prefix}animeSearch ataque`",
